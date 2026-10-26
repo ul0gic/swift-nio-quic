@@ -131,6 +131,10 @@ public struct QLogConfiguration: Sendable {
 
 @available(anyAppleOS 26, *)
 public struct QUICConfiguration: Sendable {
+    /// Per-child receive limit applied before any protocol handler receives bytes.
+    public var maximumBytesPerRead: Int = .max
+    /// Optional per-child native pending-output limit, applied before initial stream-type writes.
+    public var maximumPendingWriteBytes: Int? = nil
 
     // MARK: - Shared options
 

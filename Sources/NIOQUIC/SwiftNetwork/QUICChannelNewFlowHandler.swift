@@ -70,6 +70,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
 
     // Internal mutable state
     var keepAliveInterval: Duration?
+    var maximumBytesPerRead: Int = .max
+    private let maximumPendingWriteBytes: Int?
 
     /// The stream table inbound flows attach to, or nil if inbound streams become
     /// child channels.
@@ -86,7 +88,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         role: Role,
         streamListenerProtocol: StreamListenerLinkage,
         datagramListenerProtocol: DatagramListenerLinkage,
-        keepAliveInterval: Duration? = nil
+        keepAliveInterval: Duration? = nil,
+        maximumPendingWriteBytes: Int? = nil
     ) {
         self.local = local
         self.remote = remote
@@ -97,6 +100,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         self.remoteAddress = remoteAddress
         self.context = parameters.context
         self.keepAliveInterval = keepAliveInterval
+        self.maximumPendingWriteBytes = maximumPendingWriteBytes
         self.logPrefix = "[\(self.role.description)][NewFlowHandler]"
         self.localAddress = localAddress
         self.datagramListener = datagramListenerProtocol
@@ -241,9 +245,11 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                     remoteAddress: self.remoteAddress,
                     localAddress: self.localAddress,
                     connectionChannel: connectionChannel,
-                    keepAliveInterval: keepAliveInterval
+                    keepAliveInterval: keepAliveInterval,
+                    maximumPendingWriteBytes: self.maximumPendingWriteBytes
                 )
 
+                streamHandler.maximumBytesPerRead = self.maximumBytesPerRead
                 let linkage = try lowerProtocol.invokeAttachUpperStreamProtocolToExistingFlow(
                     streamHandler.reference,
                     flowReference: flowReference

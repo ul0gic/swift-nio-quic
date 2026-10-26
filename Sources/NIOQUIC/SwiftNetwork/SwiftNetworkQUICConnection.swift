@@ -117,6 +117,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     private var logger: Logger
     let role: Role
+    private let maximumBytesPerRead: Int
+    private let maximumPendingWriteBytes: Int?
     private let swiftNetworkParameters: SwiftNetwork.Parameters
     private let eventLoop: any EventLoop
 
@@ -333,6 +335,9 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         logger: Logger,
         usesStreamTable: Bool
     ) throws {
+        precondition(configuration.maximumBytesPerRead > 0)
+        self.maximumBytesPerRead = configuration.maximumBytesPerRead
+        self.maximumPendingWriteBytes = configuration.maximumPendingWriteBytes
         switch mode {
         case .client:
             self.role = .client
@@ -441,8 +446,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             // table has no initial stream, so its flow handler carries it too.
             keepAliveInterval: self.role == .server || usesStreamTable
                 ? configuration.keepAliveInterval
-                : nil
+                : nil,
+            maximumPendingWriteBytes: configuration.maximumPendingWriteBytes
         )
+        newFlowHandler?.maximumBytesPerRead = configuration.maximumBytesPerRead
         self.connectionNewFlowHandler = newFlowHandler
 
         // Clients set up an initial bidirectional stream (stream ID 0) so that the first
@@ -464,10 +471,12 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 listenerProtocol: streamListenerLinkage,
                 connectionChannel: nil,
                 eventLoop: self.eventLoop,
-                keepAliveInterval: configuration.keepAliveInterval
+                keepAliveInterval: configuration.keepAliveInterval,
+                maximumPendingWriteBytes: configuration.maximumPendingWriteBytes
             )
 
             if let streamHandler {
+                streamHandler.maximumBytesPerRead = configuration.maximumBytesPerRead
                 self.pendingInitialClientStream = streamHandler
             } else {
                 fatalError("Could not create a new stream handler")
@@ -672,11 +681,13 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 localAddress: localAddress,
                 listenerProtocol: listenerLinkage,
                 connectionChannel: connectionChannel,
-                eventLoop: connectionChannel.eventLoop
+                eventLoop: connectionChannel.eventLoop,
+                maximumPendingWriteBytes: self.maximumPendingWriteBytes
             )
         else {
             fatalError("Could not create a new outbound stream handler")
         }
+        streamHandler.maximumBytesPerRead = self.maximumBytesPerRead
         streamHandler.start()
 
         // Fast path: Check if the metadata is available immediately.
@@ -799,8 +810,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             logger: self.logger,
             remoteAddress: self.remoteAddress,
             localAddress: self.localAddress,
-            connectionChannel: connectionChannel
+            connectionChannel: connectionChannel,
+            maximumPendingWriteBytes: self.maximumPendingWriteBytes
         )
+        handler.maximumBytesPerRead = self.maximumBytesPerRead
         switch handler.streamStateMachine.streamConnected(direction: direction) {
         case .activateStream: break
         case .ignoreAlreadyConnected:
