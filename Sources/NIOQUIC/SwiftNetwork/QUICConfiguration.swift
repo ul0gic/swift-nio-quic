@@ -130,7 +130,16 @@ public struct QLogConfiguration: Sendable {
 }
 
 @available(anyAppleOS 26, *)
+/// Reserves raw/output payload storage synchronously on the child event loop.
+/// The callback must not reenter the channel or block. Throwing rejects that child before start.
+public typealias QUICStreamStorageReservationFactory = @Sendable (Int) throws -> (any AnyObject & Sendable)
+
+@available(anyAppleOS 26, *)
 public struct QUICConfiguration: Sendable {
+    /// Optional pre-start admission for every stream. Requires finite read and output caps.
+    /// Returned ownership remains native-held through closure and actual storage release.
+    public var streamStorageReservationFactory: QUICStreamStorageReservationFactory? = nil
+
     /// Per-child receive limit applied before any protocol handler receives bytes.
     public var maximumBytesPerRead: Int = .max
     /// Optional per-child native pending-output limit, applied before initial stream-type writes.

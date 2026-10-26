@@ -61,6 +61,13 @@ public struct QUICWriteStorageReleasedFutureOption: ChannelOption {
     public init() {}
 }
 
+/// Submitted native storage tickets awaiting complete release or callback delivery.
+/// A ticket may cover multiple derived Frames; this is not an underlying frame-count metric.
+public struct QUICNativeWriteStorageTicketsRetainedOption: ChannelOption {
+    public typealias Value = Int
+    public init() {}
+}
+
 public enum QUICWriteBufferError: Error {
     case capacityExceeded
     case nativeStorageFailed
@@ -160,9 +167,15 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     private var boundedWritesEnabled = false
     private var writesAborted = false
     private var legacyWritesStarted = false
+    private static let maximumPendingWrites = 256
+    private static let maximumNativeWriteStorageTickets = 256
+    private var nativeWriteStorageTickets = 0
     private var nativeWriteBytes = 0
     private let writeStorageReleasedPromise: EventLoopPromise<Void>
     private var writeStorageReleased = false
+    private var storageReleaseScheduled = false
+    private var storageAdmissionAttempted = false
+    private var streamStorageReservation: (any AnyObject & Sendable)?
     private var legacyBufferedWriteData: TinyArray<ByteBuffer> = []
     private var nextWriteID = 0
     private var flushedWriteCount = 0
@@ -913,7 +926,8 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     private func updateWriteWritability() {
         guard boundedWritesEnabled else { return }
         let writable = !isClosed && !writesAborted && !pendingOutputFIN && streamStateMachine.canWrite
-            && pendingWriteBytes < maximumPendingWriteBytes && writeStorage.count < 256
+            && pendingWriteBytes < maximumPendingWriteBytes && writeStorage.count < Self.maximumPendingWrites
+            && nativeWriteStorageTickets < Self.maximumNativeWriteStorageTickets
             && nativeWriteRoom() > 0
         if _isWritable.exchange(writable, ordering: .sequentiallyConsistent) != writable {
             pipeline.fireChannelWritabilityChanged()
@@ -923,6 +937,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     private func completeWriteStorage(_ id: Int, bytes: Int, success: Bool) {
         guard var storage = writeStorage[id] else { return }
         precondition(storage.fragments > 0)
+        nativeWriteStorageTickets -= 1
         nativeWriteBytes -= bytes
         storage.fragments -= 1
         storage.failed = storage.failed || !success
@@ -943,10 +958,48 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         }
     }
 
+    /// Called exactly once after attachment and before any child start/publication.
+    func acquireStorageReservation(factory: QUICStreamStorageReservationFactory?) throws {
+        eventLoop.preconditionInEventLoop()
+        precondition(!storageAdmissionAttempted && !isActive)
+        storageAdmissionAttempted = true
+        guard let factory else { return }
+        guard boundedWritesEnabled, maximumBytesPerRead > 0, maximumBytesPerRead < Int.max else {
+            throw QUICWriteBufferError.capacityExceeded
+        }
+        let (rawBytes, rawOverflow) = maximumBytesPerRead.multipliedReportingOverflow(by: 2)
+        let (outputBytes, outputOverflow) = maximumPendingWriteBytes.multipliedReportingOverflow(by: 3)
+        let (payloadBytes, sumOverflow) = rawBytes.addingReportingOverflow(outputBytes)
+        // Modeled container records only; native tickets, allocator/hash-table overhead and
+        // transport packet workspace require separate ceiling/churn measurements.
+        let (writeRecordBytes, writeRecordOverflow) = MemoryLayout<PendingWrite>.stride.addingReportingOverflow(
+            MemoryLayout<Dictionary<Int, WriteStorage>.Element>.stride
+        )
+        let (recordStride, strideOverflow) = writeRecordBytes.addingReportingOverflow(MemoryLayout<Int>.stride)
+        let (records, recordsOverflow) = recordStride.multipliedReportingOverflow(by: Self.maximumPendingWrites)
+        let (containerHeaders, headersOverflow) = MemoryLayout<[PendingWrite]>.stride.addingReportingOverflow(
+            MemoryLayout<[Int: WriteStorage]>.stride
+        )
+        let (allHeaders, snapshotOverflow) = containerHeaders.addingReportingOverflow(MemoryLayout<[Int]>.stride)
+        let (recordBytes, recordOverflow) = records.addingReportingOverflow(allHeaders)
+        let (minimumBytes, minimumOverflow) = payloadBytes.addingReportingOverflow(recordBytes)
+        guard !rawOverflow, !outputOverflow, !sumOverflow, !writeRecordOverflow, !strideOverflow,
+            !recordsOverflow, !headersOverflow, !snapshotOverflow, !recordOverflow, !minimumOverflow else {
+            throw QUICWriteBufferError.capacityExceeded
+        }
+        streamStorageReservation = try factory(minimumBytes)
+    }
+
     private func completeStorageReleaseIfClosed() {
-        guard isClosed, writeStorage.isEmpty, !writeStorageReleased else { return }
-        writeStorageReleased = true
-        writeStorageReleasedPromise.succeed()
+        guard isClosed, writeStorage.isEmpty, !writeStorageReleased, !storageReleaseScheduled else { return }
+        storageReleaseScheduled = true
+        // A close can occur inside channelRead. Let its borrowed delivery stack unwind first.
+        eventLoop.execute {
+            self.bufferedReadData = ByteBuffer()
+            self.streamStorageReservation = nil
+            self.writeStorageReleased = true
+            self.writeStorageReleasedPromise.succeed()
+        }
     }
 
     private func failBufferedWrites() {
@@ -983,11 +1036,13 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
                 finishWriteIfReleased(id)
                 continue
             }
+            guard nativeWriteStorageTickets < Self.maximumNativeWriteStorageTickets else { return }
             let room = nativeWriteRoom()
             guard room > 0 else { return }
             let count = min(room, 16_384, bufferedWriteData[0].buffer.readableBytes)
             let slice = bufferedWriteData[0].buffer.readSlice(length: count)!
             writeStorage[id]!.fragments += 1
+            nativeWriteStorageTickets += 1
             nativeWriteBytes += count
             let loop = eventLoop
             let owner = NIOLoopBound(self, eventLoop: loop)
@@ -1196,6 +1251,8 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             break
         }
 
+        let remainingCapacity = self.maximumBytesPerRead - self.bufferedReadData.readableBytes
+        guard remainingCapacity > 0 else { return 0 }
         var frameArray: FrameArray?
         do throws(NetworkError) {
             switch self.swiftNetworkStreamHandle.invokeReceiveStreamData() {
@@ -1203,7 +1260,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
                 frameArray = try linkage.invokeReceiveStreamData(
                     self.reference,
                     minimumBytes: 1,
-                    maximumBytes: self.maximumBytesPerRead
+                    maximumBytes: remainingCapacity
                 )
             case .handleViolation(let reason):
                 throw SwiftNetworkStreamHandle.violationError(operation: "invokeReceiveStreamData", reason: reason)
@@ -1442,6 +1499,9 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
         if option is QUICMaximumBytesPerReadOption {
             return self.maximumBytesPerRead as! Option.Value
         }
+        if option is QUICNativeWriteStorageTicketsRetainedOption {
+            return nativeWriteStorageTickets as! Option.Value
+        }
         if option is QUICWriteStorageReleasedFutureOption {
             return writeStorageReleasedPromise.futureResult as! Option.Value
         }
@@ -1481,12 +1541,16 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
         if option is QUICMaximumBytesPerReadOption {
             let limit = value as! Int
             precondition(limit > 0)
+            guard streamStorageReservation == nil || limit <= maximumBytesPerRead else {
+                throw QUICWriteBufferError.capacityExceeded
+            }
             self.maximumBytesPerRead = limit
             return
         }
         if option is QUICMaximumPendingWriteBytesOption {
             let maximum = value as! Int
-            guard maximum > 0, maximum >= pendingWriteBytes, legacyBufferedWriteData.isEmpty, !legacyWritesStarted else {
+            guard maximum > 0, maximum >= pendingWriteBytes, legacyBufferedWriteData.isEmpty, !legacyWritesStarted,
+                streamStorageReservation == nil || maximum <= maximumPendingWriteBytes else {
                 throw QUICWriteBufferError.capacityExceeded
             }
             maximumPendingWriteBytes = maximum
@@ -1579,7 +1643,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
             return
         }
         guard write.readableBytes <= maximumPendingWriteBytes - pendingWriteBytes,
-            writeStorage.count < 256 else {
+            writeStorage.count < Self.maximumPendingWrites else {
             promise?.fail(QUICWriteBufferError.capacityExceeded)
             if promise == nil { pipeline.fireErrorCaught(QUICWriteBufferError.capacityExceeded) }
             return
@@ -1627,6 +1691,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
         }
         self.log("_close error: \(String(describing: error))")
         self.isClosed = true
+        self.bufferedReadData = ByteBuffer()
         if boundedWritesEnabled { self.failBufferedWrites() }
         completeStorageReleaseIfClosed()
 

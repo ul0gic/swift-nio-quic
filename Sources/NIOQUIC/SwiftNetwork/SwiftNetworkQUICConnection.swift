@@ -119,6 +119,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     let role: Role
     private let maximumBytesPerRead: Int
     private let maximumPendingWriteBytes: Int?
+    private let streamStorageReservationFactory: QUICStreamStorageReservationFactory?
     private let swiftNetworkParameters: SwiftNetwork.Parameters
     private let eventLoop: any EventLoop
 
@@ -338,6 +339,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         precondition(configuration.maximumBytesPerRead > 0)
         self.maximumBytesPerRead = configuration.maximumBytesPerRead
         self.maximumPendingWriteBytes = configuration.maximumPendingWriteBytes
+        self.streamStorageReservationFactory = configuration.streamStorageReservationFactory
         switch mode {
         case .client:
             self.role = .client
@@ -447,7 +449,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             keepAliveInterval: self.role == .server || usesStreamTable
                 ? configuration.keepAliveInterval
                 : nil,
-            maximumPendingWriteBytes: configuration.maximumPendingWriteBytes
+            maximumPendingWriteBytes: configuration.maximumPendingWriteBytes,
+            streamStorageReservationFactory: configuration.streamStorageReservationFactory
         )
         newFlowHandler?.maximumBytesPerRead = configuration.maximumBytesPerRead
         self.connectionNewFlowHandler = newFlowHandler
@@ -477,6 +480,17 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
             if let streamHandler {
                 streamHandler.maximumBytesPerRead = configuration.maximumBytesPerRead
+                do {
+                    try streamHandler.acquireStorageReservation(factory: configuration.streamStorageReservationFactory)
+                } catch {
+                    // The listener was attached during this initializer but has no connection view yet.
+                    // Detach it directly; disconnecting it could invoke that uninitialized view.
+                    newFlowHandler?.teardown()
+                    self.connectionNewFlowHandler = nil
+                    streamHandler.stop(detachFromLowerProtocol: true)
+                    streamHandler.closeIfNeeded()
+                    throw error
+                }
                 self.pendingInitialClientStream = streamHandler
             } else {
                 fatalError("Could not create a new stream handler")
@@ -688,6 +702,13 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             fatalError("Could not create a new outbound stream handler")
         }
         streamHandler.maximumBytesPerRead = self.maximumBytesPerRead
+        do {
+            try streamHandler.acquireStorageReservation(factory: self.streamStorageReservationFactory)
+        } catch {
+            streamHandler.stop(detachFromLowerProtocol: true)
+            streamHandler.closeIfNeeded()
+            throw error
+        }
         streamHandler.start()
 
         // Fast path: Check if the metadata is available immediately.
@@ -814,6 +835,12 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             maximumPendingWriteBytes: self.maximumPendingWriteBytes
         )
         handler.maximumBytesPerRead = self.maximumBytesPerRead
+        do {
+            try handler.acquireStorageReservation(factory: self.streamStorageReservationFactory)
+        } catch {
+            handler.closeIfNeeded()
+            return
+        }
         switch handler.streamStateMachine.streamConnected(direction: direction) {
         case .activateStream: break
         case .ignoreAlreadyConnected:

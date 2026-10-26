@@ -72,6 +72,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     var keepAliveInterval: Duration?
     var maximumBytesPerRead: Int = .max
     private let maximumPendingWriteBytes: Int?
+    private let streamStorageReservationFactory: QUICStreamStorageReservationFactory?
 
     /// The stream table inbound flows attach to, or nil if inbound streams become
     /// child channels.
@@ -89,7 +90,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         streamListenerProtocol: StreamListenerLinkage,
         datagramListenerProtocol: DatagramListenerLinkage,
         keepAliveInterval: Duration? = nil,
-        maximumPendingWriteBytes: Int? = nil
+        maximumPendingWriteBytes: Int? = nil,
+        streamStorageReservationFactory: QUICStreamStorageReservationFactory? = nil
     ) {
         self.local = local
         self.remote = remote
@@ -101,6 +103,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         self.context = parameters.context
         self.keepAliveInterval = keepAliveInterval
         self.maximumPendingWriteBytes = maximumPendingWriteBytes
+        self.streamStorageReservationFactory = streamStorageReservationFactory
         self.logPrefix = "[\(self.role.description)][NewFlowHandler]"
         self.localAddress = localAddress
         self.datagramListener = datagramListenerProtocol
@@ -256,6 +259,14 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                 )
                 streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
                 streamHandler.setNewFlowMetadata(metadata)
+                do {
+                    try streamHandler.acquireStorageReservation(factory: self.streamStorageReservationFactory)
+                } catch {
+                    streamHandler.stop(detachFromLowerProtocol: true)
+                    streamHandler.closeIfNeeded()
+                    self.log("Rejected stream storage admission: \(error)")
+                    return
+                }
                 streamHandler.start(fromNewFlowHandler: true)
                 self.connectionView.newInboundStream(streamHandler)
 
