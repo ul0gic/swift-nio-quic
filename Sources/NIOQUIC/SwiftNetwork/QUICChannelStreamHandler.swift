@@ -1025,7 +1025,16 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             throw ChannelError.ioOnClosedChannel
         }
         guard let factory else { return }
-        guard boundedWritesEnabled, maximumBytesPerRead > 0, maximumBytesPerRead < Int.max else {
+        guard boundedWritesEnabled else { throw QUICWriteBufferError.capacityExceeded }
+        let minimumBytes = try Self.requiredStorageBytes(
+            maximumBytesPerRead: maximumBytesPerRead,
+            maximumPendingWriteBytes: maximumPendingWriteBytes
+        )
+        streamStorageReservation = try factory(minimumBytes)
+    }
+
+    static func requiredStorageBytes(maximumBytesPerRead: Int, maximumPendingWriteBytes: Int) throws -> Int {
+        guard maximumBytesPerRead > 0, maximumBytesPerRead < Int.max, maximumPendingWriteBytes > 0 else {
             throw QUICWriteBufferError.capacityExceeded
         }
         let requestedRawCapacity = min(UInt64(maximumBytesPerRead), UInt64(UInt32.max))
@@ -1052,7 +1061,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             !recordsOverflow, !headersOverflow, !snapshotOverflow, !recordOverflow, !minimumOverflow else {
             throw QUICWriteBufferError.capacityExceeded
         }
-        streamStorageReservation = try factory(minimumBytes)
+        return minimumBytes
     }
 
     private func completeStorageReleaseIfClosed() {

@@ -17,6 +17,17 @@
 public enum QUICStreamChannels: QUICStreamConsumer, ~Copyable {
     public typealias StreamState = Never
 
+    /// Modeled per-child reservation bytes; excludes allocator overhead and transport packet workspace.
+    public static func requiredStorageBytes(
+        maximumBytesPerRead: Int,
+        maximumPendingWriteBytes: Int
+    ) throws -> Int {
+        try QUICChannelStreamHandler.requiredStorageBytes(
+            maximumBytesPerRead: maximumBytesPerRead,
+            maximumPendingWriteBytes: maximumPendingWriteBytes
+        )
+    }
+
     public mutating func makeStreamState(_ stream: inout QUICStream<Self>) -> Never {
         fatalError("\(Self.self) is uninhabited")
     }
