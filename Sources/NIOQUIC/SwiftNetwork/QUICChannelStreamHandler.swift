@@ -753,7 +753,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     }
 
     // Stop and disconnect the stream handler
-    func stop(detachFromLowerProtocol: Bool = false) {
+    func stop(detachFromLowerProtocol: Bool = false, error: NetworkError? = nil) {
         log("stop")
         self.eventLoop.preconditionInEventLoop()
         if self.readTransactionActive, !self.deliveringRead { self.discardReadBatch = true }
@@ -768,7 +768,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
         switch self.swiftNetworkStreamHandle.invokeDisconnect() {
         case .proceed(let linkage):
-            linkage.invokeDisconnect(self.reference, error: nil)
+            linkage.invokeDisconnect(self.reference, error: error)
         case .ignore:
             break
         }

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import NIOCore
+import NIOQUICHelpers
 @_spi(SwiftTLSOptions) import SwiftTLS
 
 public enum Role: Sendable, CustomStringConvertible {
@@ -130,8 +131,18 @@ public struct QLogConfiguration: Sendable {
 }
 
 @available(anyAppleOS 26, *)
-/// Reserves raw/output payload storage synchronously on the child event loop.
-/// The callback must not reenter the channel or block. Throwing rejects that child before start.
+/// Throw from the storage factory to refuse an inbound stream before initialization with this application code.
+public struct QUICStreamStorageAdmissionError: Error, Sendable {
+    public let code: QUICApplicationErrorCode
+
+    public init(code: QUICApplicationErrorCode) {
+        self.code = code
+    }
+}
+
+@available(anyAppleOS 26, *)
+/// Reserves raw/output storage synchronously without blocking or reentry. Throwing rejects the child before start.
+/// Typed admission errors send their code to inbound peers; outbound failures return to the caller.
 public typealias QUICStreamStorageReservationFactory = @Sendable (Int) throws -> (any AnyObject & Sendable)
 
 @available(anyAppleOS 26, *)

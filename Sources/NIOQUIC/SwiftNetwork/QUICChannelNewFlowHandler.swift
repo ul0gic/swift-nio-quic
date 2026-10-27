@@ -272,7 +272,12 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                 do {
                     try streamHandler.acquireStorageReservation(factory: self.streamStorageReservationFactory)
                 } catch {
-                    streamHandler.stop(detachFromLowerProtocol: true)
+                    // Refuse before start/publication, preserving the application's reset code
+                    // through the native disconnect before detaching this flow.
+                    let refusal = (error as? QUICStreamStorageAdmissionError).flatMap {
+                        NetworkError(quicApplicationError: $0.code.rawValue)
+                    }
+                    streamHandler.stop(detachFromLowerProtocol: true, error: refusal)
                     streamHandler.closeIfNeeded()
                     self.log("Rejected stream storage admission: \(error)")
                     return
