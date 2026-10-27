@@ -56,6 +56,21 @@ struct ConnectionAdmissionController: ~Copyable {
     /// Number of admitted connections still mid-handshake. Always `<= activeCount`.
     private var handshakeCount: Int
 
+    private var droppedForConnectionLimit: UInt64 = 0
+    private var droppedForHandshakeLimit: UInt64 = 0
+    private var droppedForRateLimit: UInt64 = 0
+
+    @available(anyAppleOS 26, *)
+    var snapshot: QUICConnectionAdmissionSnapshot {
+        QUICConnectionAdmissionSnapshot(
+            activeConnections: self.activeCount,
+            pendingHandshakes: self.handshakeCount,
+            droppedForConnectionLimit: self.droppedForConnectionLimit,
+            droppedForHandshakeLimit: self.droppedForHandshakeLimit,
+            droppedForRateLimit: self.droppedForRateLimit
+        )
+    }
+
     /// - Parameters:
     ///   - activeLimit: Maximum active connections allowed, or `nil` for unbounded.
     ///   - handshakeLimit: Maximum connections allowed to be mid-handshake at once, or `nil` for
@@ -104,12 +119,15 @@ struct ConnectionAdmissionController: ~Copyable {
     ///     or `Decision.drop` when a connection limit was reached.
     mutating func acceptNewConnection() -> Decision {
         if let activeLimit = self.activeLimit, self.activeCount >= activeLimit {
+            if self.droppedForConnectionLimit < .max { self.droppedForConnectionLimit += 1 }
             return .drop(.activeLimitReached)
         }
         if let handshakeLimit = self.handshakeLimit, self.handshakeCount >= handshakeLimit {
+            if self.droppedForHandshakeLimit < .max { self.droppedForHandshakeLimit += 1 }
             return .drop(.handshakeLimitReached)
         }
         if let withinRateLimit = self.rateLimiter?.tryConsume(now: self.eventLoop.now), !withinRateLimit {
+            if self.droppedForRateLimit < .max { self.droppedForRateLimit += 1 }
             return .drop(.rateLimited)
         }
         self.activeCount += 1

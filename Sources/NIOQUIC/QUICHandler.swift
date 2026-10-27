@@ -82,6 +82,12 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The channel this handler resides in.
     public let udpChannel: any Channel
 
+    /// Read only on the owning event loop; occupancy is exact at this read, not a lifetime peak.
+    public var connectionAdmissionSnapshot: QUICConnectionAdmissionSnapshot {
+        self.eventLoop.assertInEventLoop()
+        return self.connectionAdmissionController.snapshot
+    }
+
     /// The QUIC configuration.
     private let quicConfiguration: QUICConfiguration
 
