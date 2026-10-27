@@ -915,7 +915,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     // We may need to propagate an error through here in the future
-    private func tearDownConnectionState() {
+    func tearDownConnectionState() {
         guard !self.connectionStateTornDown else { return }
         self.connectionStateTornDown = true
         self.connectionStreamStorage?.closeAdmission()
@@ -939,12 +939,9 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Break cycle with the datagram transport, which holds this connection as its reader.
         self.datagramTransport?.close()
         self.datagramTransport = nil
-        // Detach all paths: breaks their cycles with this connection and with SwiftNetwork, and makes them drop late
-        // packets.
-        self.activePath.finalizeQueuedOutboundFramesAsFailed()
+        // Detach producers while retaining finalized CONNECTION_CLOSE packets for the final UDP drain.
         self.activePath.detach()
         for path in self.otherPaths {
-            path.finalizeQueuedOutboundFramesAsFailed()
             path.detach()
         }
         // Break cycle with the stream table's 'outOfBandDrain'.
@@ -1035,6 +1032,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     func dropChannelReferences() {
         self.connectionStreamStorage?.closeAdmission()
         self.tearDownConnectionState()
+        // The final UDP drain has transferred packets; dispose any undeliverable remainder.
+        self.activePath.finalizeQueuedOutboundFramesAsFailed()
+        for path in self.otherPaths {
+            path.finalizeQueuedOutboundFramesAsFailed()
+        }
         self.channelView = nil
         self.connectionNewFlowHandler?.clearConnectionChannel()
 

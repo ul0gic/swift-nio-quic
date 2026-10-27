@@ -887,6 +887,10 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         // Tear down on the next loop tick.
         self.eventLoop.assumeIsolated().execute {
+            if case .live(let connection) = self._connection {
+                connection.tearDownConnectionState()
+            }
+            self.drainOutput()
             self.removeHandlers(pipeline: self.pipeline)
             self._connection.dropChannelReferences()
             self.closePromise.succeed()
