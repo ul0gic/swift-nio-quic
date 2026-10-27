@@ -120,6 +120,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private let maximumBytesPerRead: Int
     private let maximumPendingWriteBytes: Int?
     private let streamStorageReservationFactory: QUICStreamStorageReservationFactory?
+    let connectionStreamStorage: QUICConnectionStreamStorage?
     private let swiftNetworkParameters: SwiftNetwork.Parameters
     private let eventLoop: any EventLoop
 
@@ -143,6 +144,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var datagramTransport: DatagramTransport?
 
     private var connectionStateMachine = QUICConnectionStateMachine()
+    private var connectionStateTornDown = false
 
     private var finalizedOutput: Deque<ByteBuffer> = []
     private var networkContext: NetworkContext
@@ -336,6 +338,17 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         logger: Logger,
         usesStreamTable: Bool
     ) throws {
+        let connectionStreamStorage = !usesStreamTable && configuration.maximumPendingWriteBytes != nil
+            && configuration.maximumBytesPerRead < Int.max
+            ? QUICConnectionStreamStorage(eventLoop: eventLoop) : nil
+        self.connectionStreamStorage = connectionStreamStorage
+        var initialized = false
+        defer {
+            if !initialized {
+                connectionStreamStorage?.closeAdmission()
+                connectionStreamStorage?.seal()
+            }
+        }
         precondition(configuration.maximumBytesPerRead > 0)
         self.maximumBytesPerRead = configuration.maximumBytesPerRead
         self.maximumPendingWriteBytes = configuration.maximumPendingWriteBytes
@@ -450,7 +463,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 ? configuration.keepAliveInterval
                 : nil,
             maximumPendingWriteBytes: configuration.maximumPendingWriteBytes,
-            streamStorageReservationFactory: configuration.streamStorageReservationFactory
+            streamStorageReservationFactory: configuration.streamStorageReservationFactory,
+            connectionStreamStorage: connectionStreamStorage
         )
         newFlowHandler?.maximumBytesPerRead = configuration.maximumBytesPerRead
         self.connectionNewFlowHandler = newFlowHandler
@@ -475,7 +489,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 connectionChannel: nil,
                 eventLoop: self.eventLoop,
                 keepAliveInterval: configuration.keepAliveInterval,
-                maximumPendingWriteBytes: configuration.maximumPendingWriteBytes
+                maximumPendingWriteBytes: configuration.maximumPendingWriteBytes,
+                connectionStreamStorage: connectionStreamStorage
             )
 
             if let streamHandler {
@@ -544,6 +559,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             path: swiftNetworkPath,
             keyLogPath: configuration.keyLogPath
         )
+        initialized = true
     }
 
     private func start(
@@ -612,6 +628,9 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         onStreamReady:
             @escaping (Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>) -> Void
     ) throws {
+        guard self.connectionStreamStorage?.isAcceptingChildren != false else {
+            throw ChannelError.ioOnClosedChannel
+        }
         // Generate a new temporary ID for the stream.
         let temporaryID = self.temporaryIDGenerator.generate()
 
@@ -635,6 +654,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             } else {
                 pendingInitialClientStream.clearHandlers()
                 self.pendingInitialClientStream = nil
+                pendingInitialClientStream.stop(detachFromLowerProtocol: true)
+                pendingInitialClientStream.closeIfNeeded()
                 log("Initial stream is not connected. Setting up a new stream instead.")
             }
         }
@@ -696,7 +717,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 listenerProtocol: listenerLinkage,
                 connectionChannel: connectionChannel,
                 eventLoop: connectionChannel.eventLoop,
-                maximumPendingWriteBytes: self.maximumPendingWriteBytes
+                maximumPendingWriteBytes: self.maximumPendingWriteBytes,
+                connectionStreamStorage: self.connectionStreamStorage
             )
         else {
             fatalError("Could not create a new outbound stream handler")
@@ -710,6 +732,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             throw error
         }
         streamHandler.start()
+        guard self.connectionStreamStorage?.isAcceptingChildren != false else {
+            streamHandler.stop(detachFromLowerProtocol: true)
+            streamHandler.closeIfNeeded()
+            throw ChannelError.ioOnClosedChannel
+        }
 
         // Fast path: Check if the metadata is available immediately.
         guard let metadata: ProtocolMetadata<QUICProtocol> = streamHandler.getStreamMetadata(),
@@ -756,12 +783,14 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 let pendingStreamData = self.pendingOutboundStreams.removeValue(forKey: temporaryID)
                 if let pendingStreamData {
                     pendingStreamData.streamHandler.clearHandlers()
+                    pendingStreamData.streamHandler.stop(detachFromLowerProtocol: true)
+                    pendingStreamData.streamHandler.closeIfNeeded()
                     pendingStreamData.onStreamReady(.failure(QUICError.invalidStreamState))
                 }
                 return
             }
 
-            guard let outboundStreamData = self.pendingOutboundStreams[temporaryID] else {
+            guard let outboundStreamData = self.pendingOutboundStreams.removeValue(forKey: temporaryID) else {
                 // Fast path already ran
                 return
             }
@@ -771,7 +800,6 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 streamHandler: outboundStreamData.streamHandler,
                 onStreamReady: outboundStreamData.onStreamReady
             )
-            self.pendingOutboundStreams.removeValue(forKey: temporaryID)
         }
     }
 
@@ -792,13 +820,19 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         streamHandler: QUICChannelStreamHandler,
         onStreamReady: (Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>) -> Void
     ) {
-        // This should be true. Either we arrive here throught he connected callback,
-        // which schedules this on the event loop or through the fast path, which
-        // checks the connected status.
-        assert(
-            streamHandler.streamStateMachine.isConnected,
-            "Outbound stream handler for temporary ID \(temporaryID) is not connected"
-        )
+        guard self.connectionStreamStorage?.isAcceptingChildren != false else {
+            streamHandler.stop(detachFromLowerProtocol: true)
+            streamHandler.closeIfNeeded()
+            onStreamReady(.failure(ChannelError.ioOnClosedChannel))
+            return
+        }
+        guard streamHandler.streamStateMachine.isConnected, streamHandler.isActive else {
+            streamHandler.clearHandlers()
+            streamHandler.stop(detachFromLowerProtocol: true)
+            streamHandler.closeIfNeeded()
+            onStreamReady(.failure(QUICError.invalidStreamState))
+            return
+        }
 
         // Ensure the stream handler has the stream ID assigned.
         streamHandler.streamID = streamID
@@ -832,7 +866,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             remoteAddress: self.remoteAddress,
             localAddress: self.localAddress,
             connectionChannel: connectionChannel,
-            maximumPendingWriteBytes: self.maximumPendingWriteBytes
+            maximumPendingWriteBytes: self.maximumPendingWriteBytes,
+            connectionStreamStorage: self.connectionStreamStorage
         )
         handler.maximumBytesPerRead = self.maximumBytesPerRead
         do {
@@ -881,18 +916,21 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     // We may need to propagate an error through here in the future
     private func tearDownConnectionState() {
+        guard !self.connectionStateTornDown else { return }
+        self.connectionStateTornDown = true
+        self.connectionStreamStorage?.closeAdmission()
+        let pendingStreams = self.pendingOutboundStreams
+        self.pendingOutboundStreams.removeAll()
         self.activePath.finalizeQueuedInboundFramesAsFailed()
         for path in self.otherPaths {
             path.finalizeQueuedInboundFramesAsFailed()
         }
-        for (_, streamHandler) in self.streamInputHandlers {
-            streamHandler.stop(detachFromLowerProtocol: true)
-        }
-        for (_, pendingStreamData) in self.pendingOutboundStreams {
+        _ = self.closeAllStreams()
+        for (_, pendingStreamData) in pendingStreams {
             pendingStreamData.streamHandler.stop(detachFromLowerProtocol: true)
+            pendingStreamData.streamHandler.closeIfNeeded()
             pendingStreamData.onStreamReady(.failure(ChannelError.ioOnClosedChannel))
         }
-        self.pendingOutboundStreams.removeAll()
         if let connectionNewFlowHandler = self.connectionNewFlowHandler {
             connectionNewFlowHandler.stop()
             connectionNewFlowHandler.teardown()
@@ -903,8 +941,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.datagramTransport = nil
         // Detach all paths: breaks their cycles with this connection and with SwiftNetwork, and makes them drop late
         // packets.
+        self.activePath.finalizeQueuedOutboundFramesAsFailed()
         self.activePath.detach()
         for path in self.otherPaths {
+            path.finalizeQueuedOutboundFramesAsFailed()
             path.detach()
         }
         // Break cycle with the stream table's 'outOfBandDrain'.
@@ -931,6 +971,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             log("close() returning early - already terminating")
             return .alreadyClosed
         }
+
+        self.connectionStreamStorage?.closeAdmission()
 
         // Capture before initiateClose() below mutates the state machine. A `.connecting`
         // connection transitions straight to `.closed`, and `hasEstablishedConnection`
@@ -991,6 +1033,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// a retain cycle that keeps both alive forever. The channel calls this once it has gone
     /// inactive so both can deinit.
     func dropChannelReferences() {
+        self.connectionStreamStorage?.closeAdmission()
+        self.tearDownConnectionState()
         self.channelView = nil
         self.connectionNewFlowHandler?.clearConnectionChannel()
 
@@ -1001,6 +1045,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             streamHandler.connectionChannel = nil
         }
         self.streamInputHandlers.removeAll()
+        self.connectionStreamStorage?.seal()
     }
 
     func removeStreamHandler(streamID: QUICStreamID) -> Bool {
@@ -1012,11 +1057,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     func closeAllStreams() -> [EventLoopFuture<Void>] {
-        if streamInputHandlers.isEmpty {
-            return []
-        }
-        let futures = streamInputHandlers.map { $0.1.closeFuture }
-        for (_, stream) in streamInputHandlers {
+        var streams = streamInputHandlers.map { $0.1 }
+        if let pendingInitialClientStream { streams.append(pendingInitialClientStream) }
+        streams.append(contentsOf: pendingOutboundStreams.values.map { $0.streamHandler })
+        let futures = streams.map { $0.closeFuture }
+        for stream in streams {
             stream.stop(detachFromLowerProtocol: true)
             stream.closeIfNeeded()
         }
@@ -1407,6 +1452,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 
     /// Handle disconnected events from SwiftNetwork for connection-level handlers (e.g., newFlowHandler).
     private func handleConnectionDisconnected(error: NetworkError?) {
+        self.connectionStreamStorage?.closeAdmission()
         // State machine handles all error inspection and conversion
         let (stateAction, errorAction) = self.connectionStateMachine.receiveDisconnectedEvent(error: error)
 

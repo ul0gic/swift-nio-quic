@@ -73,6 +73,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     var maximumBytesPerRead: Int = .max
     private let maximumPendingWriteBytes: Int?
     private let streamStorageReservationFactory: QUICStreamStorageReservationFactory?
+    private let connectionStreamStorage: QUICConnectionStreamStorage?
 
     /// The stream table inbound flows attach to, or nil if inbound streams become
     /// child channels.
@@ -91,7 +92,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         datagramListenerProtocol: DatagramListenerLinkage,
         keepAliveInterval: Duration? = nil,
         maximumPendingWriteBytes: Int? = nil,
-        streamStorageReservationFactory: QUICStreamStorageReservationFactory? = nil
+        streamStorageReservationFactory: QUICStreamStorageReservationFactory? = nil,
+        connectionStreamStorage: QUICConnectionStreamStorage? = nil
     ) {
         self.local = local
         self.remote = remote
@@ -104,6 +106,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         self.keepAliveInterval = keepAliveInterval
         self.maximumPendingWriteBytes = maximumPendingWriteBytes
         self.streamStorageReservationFactory = streamStorageReservationFactory
+        self.connectionStreamStorage = connectionStreamStorage
         self.logPrefix = "[\(self.role.description)][NewFlowHandler]"
         self.localAddress = localAddress
         self.datagramListener = datagramListenerProtocol
@@ -216,6 +219,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         flowMetadata: AbstractProtocolMetadata?
     ) {
         log("received new inbound flow")
+        guard self.connectionStreamStorage?.isAcceptingChildren != false else { return }
 
         guard let lowerProtocol = self.lowerProtocol else {
             self.log("Dropping new inbound flow: lower protocol has been detached")
@@ -249,15 +253,21 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                     localAddress: self.localAddress,
                     connectionChannel: connectionChannel,
                     keepAliveInterval: keepAliveInterval,
-                    maximumPendingWriteBytes: self.maximumPendingWriteBytes
+                    maximumPendingWriteBytes: self.maximumPendingWriteBytes,
+                    connectionStreamStorage: self.connectionStreamStorage
                 )
 
                 streamHandler.maximumBytesPerRead = self.maximumBytesPerRead
-                let linkage = try lowerProtocol.invokeAttachUpperStreamProtocolToExistingFlow(
-                    streamHandler.reference,
-                    flowReference: flowReference
-                )
-                streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
+                do throws(NetworkError) {
+                    let linkage = try lowerProtocol.invokeAttachUpperStreamProtocolToExistingFlow(
+                        streamHandler.reference,
+                        flowReference: flowReference
+                    )
+                    streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
+                } catch {
+                    streamHandler.closeIfNeeded()
+                    throw error
+                }
                 streamHandler.setNewFlowMetadata(metadata)
                 do {
                     try streamHandler.acquireStorageReservation(factory: self.streamStorageReservationFactory)

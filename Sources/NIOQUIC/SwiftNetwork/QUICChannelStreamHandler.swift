@@ -176,6 +176,8 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     private var storageReleaseScheduled = false
     private var storageAdmissionAttempted = false
     private var streamStorageReservation: (any AnyObject & Sendable)?
+    private var connectionStreamStorage: QUICConnectionStreamStorage?
+    private var registeredConnectionStorage = false
     private var legacyBufferedWriteData: TinyArray<ByteBuffer> = []
     private var nextWriteID = 0
     private var flushedWriteCount = 0
@@ -216,9 +218,11 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         localAddress: SocketAddress?,
         connectionChannel: any Channel,
         keepAliveInterval: Duration? = nil,
-        maximumPendingWriteBytes: Int? = nil
+        maximumPendingWriteBytes: Int? = nil,
+        connectionStreamStorage: QUICConnectionStreamStorage? = nil
     ) {
         self.role = role
+        self.connectionStreamStorage = connectionStreamStorage
         self.streamID = streamID
         self.logger = logger
         self._remoteAddress = remoteAddress
@@ -247,6 +251,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
 
         // This creates a retain cycle, it's broken in close '_close(error:promise:)'
         self.reference = ProtocolInstanceReference(custom: self)
+        self.registeredConnectionStorage = connectionStreamStorage?.registerChild() ?? false
     }
 
     internal init?(
@@ -264,8 +269,10 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         eventLoop: any EventLoop,
         keepAliveInterval: Duration? = nil,
         maximumPendingWriteBytes: Int? = nil,
+        connectionStreamStorage: QUICConnectionStreamStorage? = nil
     ) {
         self.role = role
+        self.connectionStreamStorage = connectionStreamStorage
         self.streamID = streamID
         self.logger = logger
         self._remoteAddress = remoteAddress
@@ -305,10 +312,12 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             )
         } catch {
             self.log("Error attaching lower protocol: \(error)")
+            self.reference = ProtocolInstanceReference()
             return nil
         }
         self.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
         self._pipeline = ChannelPipeline(channel: self)
+        self.registeredConnectionStorage = connectionStreamStorage?.registerChild() ?? false
     }
 
     /// The stream direction based on the stream ID and the local peer's role.
@@ -963,6 +972,10 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         eventLoop.preconditionInEventLoop()
         precondition(!storageAdmissionAttempted && !isActive)
         storageAdmissionAttempted = true
+        if let connectionStreamStorage,
+            !registeredConnectionStorage || !connectionStreamStorage.isAcceptingChildren {
+            throw ChannelError.ioOnClosedChannel
+        }
         guard let factory else { return }
         guard boundedWritesEnabled, maximumBytesPerRead > 0, maximumBytesPerRead < Int.max else {
             throw QUICWriteBufferError.capacityExceeded
@@ -1003,6 +1016,8 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             self.streamStorageReservation = nil
             self.writeStorageReleased = true
             self.writeStorageReleasedPromise.succeed()
+            if self.registeredConnectionStorage { self.connectionStreamStorage?.releaseChild() }
+            self.connectionStreamStorage = nil
         }
     }
 

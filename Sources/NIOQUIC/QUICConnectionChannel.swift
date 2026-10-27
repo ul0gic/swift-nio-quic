@@ -62,6 +62,7 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
 
     /// The underlying SwiftNetwork-backed QUIC connection.
     private let _connection: Connection
+    private let _streamStorageReleasedFuture: EventLoopFuture<Void>?
 
     /// A registrar for connection IDs.
     private let _registrar: ConnectionIDRegistrar
@@ -152,6 +153,12 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         self.isServer = isServer
 
         self._connection = connection
+        switch connection {
+        case .live(let live):
+            self._streamStorageReleasedFuture = live.connectionStreamStorage?.futureResult
+        case .test:
+            self._streamStorageReleasedFuture = nil
+        }
         self._registrar = registrar
         self._transport = transport
         self._table = table
@@ -256,6 +263,11 @@ extension QUICConnectionChannel: Channel where Consumer: ~Copyable {
             switch option {
             case is ChannelOptions.Types.AutoReadOption:
                 return self.channel._autoRead as! Option.Value
+            case is QUICConnectionStreamStorageReleasedFutureOption:
+                guard let future = self.channel._streamStorageReleasedFuture else {
+                    throw ChannelError.operationUnsupported
+                }
+                return future as! Option.Value
             default:
                 throw ChannelError.operationUnsupported
             }
@@ -814,6 +826,9 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
     fileprivate func fireChannelInactiveNow(error: (any Error)? = nil) {
         self.eventLoop.assertInEventLoop()
+        if case .live(let connection) = self._connection {
+            connection.connectionStreamStorage?.closeAdmission()
+        }
 
         // Stop accepting more inbound streams.
         switch self._streamInitializer.take() {
@@ -942,6 +957,9 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     /// Used by the registry when graceful shutdown overran its deadline.
     fileprivate func _forceClose() {
         self.eventLoop.assertInEventLoop()
+        if case .live(let connection) = self._connection {
+            connection.connectionStreamStorage?.closeAdmission()
+        }
 
         switch self._lifecycle.forceClosing() {
         case .alreadyClosed:
