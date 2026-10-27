@@ -192,6 +192,7 @@ public struct QUICConfiguration: Sendable {
 
     /// The host name of the QUIC server created with this configuration.
     public var serverName: String?
+    public var receivedServerNameValidator: (@Sendable (String?) -> Bool)? = nil
     /// Direct the QUIC server to send retry packets before accepting connections. Only supported by the server.
     /// Defaults to `false`.
     public var sendRetry: Bool = false

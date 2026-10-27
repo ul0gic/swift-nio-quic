@@ -51,10 +51,10 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.1")),
         .package(
             url: "https://github.com/ul0gic/swift-network-evolution",
-            revision: "2868d16fd31216ef617311210bacaa4a1f24994f",
+            revision: "e9278c717d4cdb12ac64cf31df6c81f2a021d309",
             traits: swiftNetworkTraits
         ),
-        .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.1.0")),
+        .package(url: "https://github.com/ul0gic/swift-tls.git", revision: "52e645b8ffccbfb72b22d009c3fc2480c546f3bf"),
     ],
     targets: [
         .executableTarget(

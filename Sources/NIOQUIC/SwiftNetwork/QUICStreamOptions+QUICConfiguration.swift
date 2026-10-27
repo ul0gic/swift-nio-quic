@@ -68,6 +68,7 @@ extension TLSProtocol.Options {
         options.applicationProtocols = config.applicationProtocols
         options.serverName = serverName
         options.tlsOptions.keyExchangeGroup = config.keyExchangeGroup.swiftTLSKeyExchangeGroup
+        options.tlsOptions.receivedServerNameValidator = config.receivedServerNameValidator
 
         switch authConfig {
         case .x509Certificates:
