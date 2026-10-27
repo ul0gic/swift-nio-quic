@@ -258,7 +258,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self.writeStorageReleasedPromise = connectionChannel.eventLoop.makePromise(of: Void.self)
         self._pipeline = ChannelPipeline(channel: self)
 
-        // This creates a retain cycle, it's broken in close '_close(error:promise:)'
+        // Native detach requires this identity after the application channel closes.
         self.reference = ProtocolInstanceReference(custom: self)
         self.registeredConnectionStorage = connectionStreamStorage?.registerChild() ?? false
     }
@@ -307,7 +307,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
         self._closePromise = eventLoop.makePromise(of: Void.self)
         self.writeStorageReleasedPromise = eventLoop.makePromise(of: Void.self)
 
-        // This creates a retain cycle, it's broken in close '_close(error:promise:)'
+        // Native detach requires this identity after the application channel closes.
         self.reference = ProtocolInstanceReference(custom: self)
 
         let linkage: OutboundStreamLinkage
@@ -773,16 +773,7 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             break
         }
         if detachFromLowerProtocol {
-            switch self.swiftNetworkStreamHandle.invokeDetach() {
-            case .proceed(let linkage):
-                do throws(NetworkError) {
-                    try linkage.invokeDetach(self.reference)
-                } catch {
-                    self.log("Failed to detach lower protocol: \(error)")
-                }
-            case .skipAlreadyDetached:
-                break
-            }
+            self.detachLowerProtocol()
         }
     }
 
@@ -807,6 +798,13 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
     }
 
     private func finishDisconnectedEvent(error: NetworkError?) {
+        self.detachLowerProtocol()
+
+        let quicError = error.flatMap { QUICConnectionError(networkError: $0) }
+        self._close(error: quicError ?? error, promise: nil)
+    }
+
+    private func detachLowerProtocol() {
         switch self.swiftNetworkStreamHandle.invokeDetach() {
         case .proceed(let linkage):
             do throws(NetworkError) {
@@ -814,12 +812,10 @@ final class QUICChannelStreamHandler: ProtocolInstanceContainer, InboundStreamHa
             } catch {
                 self.log("Failed to detach lower protocol: \(error)")
             }
+            self.reference = ProtocolInstanceReference()
         case .skipAlreadyDetached:
             break
         }
-
-        let quicError = error.flatMap { QUICConnectionError(networkError: $0) }
-        self._close(error: quicError ?? error, promise: nil)
     }
 
     @inline(__always)
@@ -1808,8 +1804,9 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
             if let disconnect = self.disconnectedEventHandler {
                 disconnect(nil)
             }
-            // Break the retain cycle between the ref and self.
-            self.reference = ProtocolInstanceReference()
+            if !self.swiftNetworkStreamHandle.hasNativeAttachment {
+                self.reference = ProtocolInstanceReference()
+            }
             self.clearHandlers()
         }
     }

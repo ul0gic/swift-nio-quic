@@ -2371,6 +2371,10 @@ struct SwiftNetworkStreamHandle: ~Copyable {
         self.stateMachine.isAttached
     }
 
+    var hasNativeAttachment: Bool {
+        !self.linkage.isDetached
+    }
+
     // MARK: - Wrapper methods
     //
     // Every wrapper here returns an action that, on the success path, carries
@@ -2490,13 +2494,13 @@ struct SwiftNetworkStreamHandle: ~Copyable {
         case skipAlreadyDetached
     }
 
-    /// Mutating: transitions the SM to `.detached` before returning. The
-    /// modify borrow ends with the return; the caller performs `invokeDetach`
-    /// on the returned linkage value without holding any borrow on the handle.
+    // Transfer ownership before external detach so synchronous callbacks cannot detach twice.
     mutating func invokeDetach() -> InvokeDetachAction {
         switch self.stateMachine.invokeDetach() {
         case .performDetach:
-            return .proceed(self.linkage)
+            let linkage = self.linkage
+            self.linkage = OutboundStreamLinkage(reference: .init())
+            return .proceed(linkage)
         case .skipAlreadyDetached:
             return .skipAlreadyDetached
         }
