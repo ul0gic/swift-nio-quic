@@ -99,7 +99,7 @@ extension TLSProtocol.Options {
     ) throws -> Self {
         var options = SwiftTLSProtocol.Options()
         options.applicationProtocols = config.applicationProtocols
-        options.serverName = serverName
+        options.serverName = serverName.isIPAddress ? nil : serverName
         options.tlsOptions.keyExchangeGroup = config.keyExchangeGroup.swiftTLSKeyExchangeGroup
 
         if let verificationConfiguration = config.verificationConfiguration {
